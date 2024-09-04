@@ -31,8 +31,6 @@ The licensor cannot revoke these freedoms as long as you follow the license term
 
 ---
 
-This deed highlights only some of the key features and terms of the actual license. It is not a license and has no legal value. You should carefully review all of the terms and conditions of the actual license before using the licensed material.
-
 **Creative Commons** is the nonprofit behind the open licenses and other legal tools that allow creators to share their work. Our legal tools are free to use.
 
 Learn more about our work: [Creative Commons](https://creativecommons.org/)
