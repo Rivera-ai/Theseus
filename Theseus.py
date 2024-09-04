@@ -44,26 +44,36 @@ class RealVideoDataset(Dataset):
         return frames, encoded_text['input_ids'].squeeze(0)
 
     def load_video(self, video_path, max_frames=16):
-      cap = cv2.VideoCapture(video_path)
-      frames = []
-      while True:
-          ret, frame = cap.read()
-          if not ret:
-              break
-          frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-          frame = Image.fromarray(frame)
-          frames.append(frame)
+        cap = cv2.VideoCapture(video_path)
+        frames = []
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frame = Image.fromarray(frame)
+            frames.append(frame)
 
-      cap.release()
+        cap.release()
 
-    # Make sure all videos have the same amount of frames
-      if len(frames) > max_frames:
-          frames = frames[:max_frames]
-      elif len(frames) < max_frames:
-          frames.extend([frames[-1]] * (max_frames - len(frames)))  # Padding with the last frame
+        # Make sure all videos have the same amount of frames
+        if len(frames) > max_frames:
+            frames = frames[:max_frames]
+        elif len(frames) < max_frames:
+            frames.extend([frames[-1]] * (max_frames - len(frames)))  # Padding with the last frame
 
-      return frames
+        return frames
 
+
+class CausalConv3d(nn.Conv3d):
+    """ Causal 3D convolution layer for temporal consistency. """
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0):
+        super(CausalConv3d, self).__init__(in_channels, out_channels, kernel_size, stride, padding)
+        self.pad = (self.kernel_size[0] - 1, 0, 0, 0, 0, 0)
+
+    def forward(self, x):
+        x = nn.functional.pad(x, self.pad)
+        return super(CausalConv3d, self).forward(x)
 
 
 class VAE3D(nn.Module):
@@ -71,7 +81,7 @@ class VAE3D(nn.Module):
         super(VAE3D, self).__init__()
         # Encoder
         self.encoder = nn.Sequential(
-            nn.Conv3d(in_channels, 64, kernel_size=4, stride=2, padding=1),
+            CausalConv3d(in_channels, 64, kernel_size=(3, 3, 3), stride=1, padding=(0, 1, 1)),
             nn.ReLU(True),
             nn.Conv3d(64, 128, kernel_size=4, stride=2, padding=1),
             nn.ReLU(True),
@@ -81,8 +91,8 @@ class VAE3D(nn.Module):
             nn.ReLU(True)
         )
 
-        self.fc_mu = nn.Linear(512 * 1 * 4 * 4, latent_dim)
-        self.fc_logvar = nn.Linear(512 * 1 * 4 * 4, latent_dim)
+        self.fc_mu = nn.Linear(32768, latent_dim)
+        self.fc_logvar = nn.Linear(32768, latent_dim)
 
         # Decoder
         self.fc_decoder = nn.Linear(latent_dim, 512 * 1 * 4 * 4)
@@ -94,12 +104,13 @@ class VAE3D(nn.Module):
             nn.ReLU(True),
             nn.ConvTranspose3d(128, 64, kernel_size=4, stride=2, padding=1),
             nn.ReLU(True),
-            nn.ConvTranspose3d(64, in_channels, kernel_size=4, stride=2, padding=1),
+            nn.ConvTranspose3d(64, in_channels, kernel_size=(3, 4, 4), stride=2, padding=(0, 1, 1)),
             nn.Sigmoid()
         )
 
     def encode(self, x):
         h = self.encoder(x)
+        print(h.shape)
         h = h.view(h.size(0), -1)
         return self.fc_mu(h), self.fc_logvar(h)
 
@@ -118,8 +129,9 @@ class VAE3D(nn.Module):
         z = self.reparameterize(mu, logvar)
         return self.decode(z), mu, logvar
 
+
 class ExpertTransformer(nn.Module):
-    def __init__(self, vocab_size, embed_dim=762, num_heads=6, num_layers=12):
+    def __init__(self, vocab_size, embed_dim=512, num_heads=8, num_layers=6):
         super(ExpertTransformer, self).__init__()
         self.embedding = nn.Embedding(vocab_size, embed_dim)
         self.transformer = nn.TransformerEncoder(
@@ -139,6 +151,7 @@ class Theseus(nn.Module):
         super(Theseus, self).__init__()
         self.vae = vae
         self.transformer = transformer
+        self.expert_adaln = nn.LayerNorm(512)  # Adapt for different modalities
 
     def forward(self, x_video, x_text):
         # VAE to compress the video
@@ -148,13 +161,15 @@ class Theseus(nn.Module):
         # Transformer to process the text
         z_text = self.transformer(x_text)
 
-        # Combine vision and text features
-        z_combined = z_vision + z_text
+        # Normalize and combine vision and text features
+        z_vision = self.expert_adaln(z_vision)
+        z_combined = z_vision + z_text.unsqueeze(1)  # Adjust for 3D tensors
 
         # Rebuild the video
         reconstructed_video = self.vae.decode(z_combined)
 
         return reconstructed_video, mu, logvar
+
 
 def save_video(tensor, path):
     tensor = tensor.detach().permute(1, 2, 3, 0).cpu().numpy()  # Switch to (T, H, W, C)
@@ -167,6 +182,7 @@ def save_video(tensor, path):
         out.write(frame)
 
     out.release()
+
 
 def train_model(model, dataloader, num_epochs, device):
     optimizer = optim.AdamW(model.parameters(), lr=0.001)
@@ -183,6 +199,10 @@ def train_model(model, dataloader, num_epochs, device):
 
             reconstructed_videos, mu, logvar = model(videos, texts)
 
+            # Recorta el video reconstruido a la longitud del video original
+            if reconstructed_videos.size(2) != videos.size(2):
+                reconstructed_videos = reconstructed_videos[:, :, :videos.size(2), :, :]
+
             reconstruction_loss = criterion(reconstructed_videos, videos)
             kl_divergence = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
             loss = reconstruction_loss + 0.001 * kl_divergence
@@ -194,7 +214,9 @@ def train_model(model, dataloader, num_epochs, device):
 
         print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {running_loss/len(dataloader):.4f}")
 
-    print("Entrenamiento completado")
+    print("Training complete")
+
+
 
 def evaluate_model(model, dataloader, device):
     model.eval()
@@ -207,6 +229,9 @@ def evaluate_model(model, dataloader, device):
             texts = texts.to(device)
 
             reconstructed_videos, _, _ = model(videos, texts)
+
+            if reconstructed_videos.size(2) != videos.size(2):
+                reconstructed_videos = reconstructed_videos[:, :, :videos.size(2), :, :]
 
             loss = criterion(reconstructed_videos, videos)
             total_loss += loss.item()
@@ -221,7 +246,6 @@ batch_size = 1
 max_length = 512
 num_epochs = 100
 
-
 transform = transforms.Compose([
     transforms.Lambda(lambda frames: torch.stack([transforms.ToTensor()(frame) for frame in frames])),  # Convertir cada frame a tensor
     transforms.Lambda(lambda x: x.permute(1, 0, 2, 3)), # Switch to (C, T, H, W)
@@ -230,26 +254,20 @@ transform = transforms.Compose([
     transforms.Lambda(lambda x: x.squeeze(0))  # Remove batch dimension: (C, T, H, W)
 ])
 
-
-
 dataset = RealVideoDataset(json_file, video_dir, transform=transform, max_length=512)
 dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
-
-vae = VAE3D(in_channels=3, latent_dim=762)
-transformer = ExpertTransformer(vocab_size=len(dataset.tokenizer), embed_dim=762)
+vae = VAE3D(in_channels=3, latent_dim=512)
+transformer = ExpertTransformer(vocab_size=len(dataset.tokenizer), embed_dim=512)
 model = Theseus(vae, transformer)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = model.to(device)
 
-
 train_model(model, dataloader, num_epochs, device)
-
 
 avg_loss = evaluate_model(model, dataloader, device)
 print(f"Average reconstruction loss: {avg_loss:.4f}")
-
 
 for i, (video, text) in enumerate(dataloader):
     if i >= 3:
@@ -262,4 +280,4 @@ for i, (video, text) in enumerate(dataloader):
 
     save_video(reconstructed_video[0], f'reconstructed_video_{i+1}.mp4')
 
-print("Evaluación completada y videos reconstruidos guardados.")
+print("Evaluation complete and reconstructed videos saved.")
