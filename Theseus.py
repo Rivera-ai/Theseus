@@ -43,7 +43,7 @@ class RealVideoDataset(Dataset):
 
         return frames, encoded_text['input_ids'].squeeze(0)
 
-    def load_video(self, video_path, max_frames=16):
+    def load_video(self, video_path, max_frames=32):
         cap = cv2.VideoCapture(video_path)
         frames = []
         while True:
@@ -151,7 +151,8 @@ class Theseus(nn.Module):
         super(Theseus, self).__init__()
         self.vae = vae
         self.transformer = transformer
-        self.expert_adaln = nn.LayerNorm(512)  # Adapt for different modalities
+        self.expert_adaln = nn.LayerNorm(1024)  # Adapt for different modalities
+        self.text_mapper = nn.Linear(512, 1024)
 
     def forward(self, x_video, x_text):
         # VAE to compress the video
@@ -160,6 +161,7 @@ class Theseus(nn.Module):
 
         # Transformer to process the text
         z_text = self.transformer(x_text)
+        z_text = self.text_mapper(z_text)
 
         # Normalize and combine vision and text features
         z_vision = self.expert_adaln(z_vision)
@@ -244,7 +246,7 @@ json_file = '/content/data/video_descriptions.json'
 video_dir = '/content/data/Videos/'
 batch_size = 1
 max_length = 512
-num_epochs = 100
+num_epochs = 200
 
 transform = transforms.Compose([
     transforms.Lambda(lambda frames: torch.stack([transforms.ToTensor()(frame) for frame in frames])),  # Convertir cada frame a tensor
@@ -257,7 +259,7 @@ transform = transforms.Compose([
 dataset = RealVideoDataset(json_file, video_dir, transform=transform, max_length=512)
 dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
-vae = VAE3D(in_channels=3, latent_dim=512)
+vae = VAE3D(in_channels=3, latent_dim=1024)
 transformer = ExpertTransformer(vocab_size=len(dataset.tokenizer), embed_dim=512)
 model = Theseus(vae, transformer)
 
