@@ -48,3 +48,13 @@ This project is licensed under the Attribution-NonCommercial 4.0 International (
 ---
 
 Feel free to explore, modify, and experiment with the code. Contributions and improvements are welcome!
+
+## Star History
+
+<a href="https://star-history.com/#Rivera-ai/Theseus&Timeline">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=Rivera-ai/Theseus&type=Timeline&theme=dark" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=Rivera-ai/Theseus&type=Timeline" />
+   <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=Rivera-ai/Theseus&type=Timeline" />
+ </picture>
+</a>
