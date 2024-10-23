@@ -4,6 +4,7 @@ import torch.nn as nn
 from torch.utils.checkpoint import checkpoint, checkpoint_sequential
 import numpy as np
 
+
 def set_grad_checkpoint(model, use_fp32_attention=False, gc_step=1):
     assert isinstance(model, nn.Module)
 

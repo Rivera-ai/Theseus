@@ -3,6 +3,7 @@ import torch
 from ReSpace import SpacedDiffusion, space_timesteps
 import GaussianDiffusion as gd
 
+
 class IDDPM(SpacedDiffusion):
 
     def __init__(self, num_sampling_steps=None, timestep_respacing=None, noise_schedule="linear", use_kl=False, sigma_small=False, predict_xstart=False, learn_sigma=True, rescale_learned_sigmas=False, diffusion_steps=1000, cfg_scale=4.0, **kwargs):

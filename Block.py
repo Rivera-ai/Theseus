@@ -10,6 +10,7 @@ from Utils import forward_hook_func, backward_hook_func
 
 approx_gelu = lambda: nn.GELU(approximate="tanh")
 
+
 def modulate(x, shift, scale):
     return x * (1 + scale) + shift
 

@@ -1,6 +1,5 @@
 import numpy as np
 import torch as th
-
 from GaussianDiffusion import GaussianDiffusion
 
 def space_timesteps(num_timesteps, section_counts):

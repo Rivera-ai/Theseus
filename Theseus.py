@@ -1,13 +1,9 @@
 import torch
 import torch.nn as nn
-
 import numpy as np
-
 from timm.models.vision_transformer import Mlp
 from timm.models.layers import DropPath
-
 from einops import rearrange
-
 from Block import (
     approx_gelu,
     modulate,

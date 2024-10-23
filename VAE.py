@@ -3,6 +3,7 @@ import torch.nn as nn
 from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
 from einops import rearrange
 
+
 class VideoAutoEncoderKL(nn.Module):
     def __init__(self, pretrained_model, subfolder="", dtype=torch.float16, micro_batch_size=None, patch_size=(1, 8, 8), *args, **kwargs) -> None: 
         super().__init__(*args, **kwargs)

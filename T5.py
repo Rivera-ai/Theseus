@@ -16,6 +16,7 @@ import torch.nn as nn
 # Algunas clases y funciones han sido tomadas del repo Open-Sora: https://github.com/hpcaitech/Open-Sora
 
 
+
 def requires_grad(model: torch.nn.Module, flag: bool = True) -> None:
     """
     Set requires_grad flag for all parameters in a model.

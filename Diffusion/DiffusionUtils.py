@@ -1,6 +1,7 @@
 import torch
 import numpy as np
 
+
 def NormalKl(mean1, logvar1, mean2, logvar2):
     """
         Calcula la divergencia KL entre dos gaussianas.
