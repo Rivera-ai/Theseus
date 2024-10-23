@@ -1,407 +1,472 @@
-import json
 import torch
 import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms
-import cv2
+
 import numpy as np
-from PIL import Image
-from transformers import GPT2Tokenizer
-import os
-from torchvision.models import vgg16, VGG16_Weights
-import torch.nn.functional as F
 
-class RealVideoDataset(Dataset):
-    def __init__(self, json_file, video_dir, transform=None, max_length=512):
-        with open(json_file, 'r') as f:
-          self.data = json.load(f)
-        self.video_dir = video_dir
-        self.transform = transform
-        self.tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
-        self.tokenizer.pad_token = self.tokenizer.eos_token
-        self.max_length = max_length
+from timm.models.vision_transformer import Mlp
+from timm.models.layers import DropPath
 
-    def __len__(self):
-        return len(self.data)
+from einops import rearrange
 
-    def __getitem__(self, idx):
-        video_path = os.path.join(self.video_dir, self.data[idx]['video_file'])
-        description = self.data[idx]['description']
+from Block import (
+    approx_gelu,
+    modulate,
+    get_layernorm,
+    Attention,
+    MultiHeadCrossAttention,
+    Conv3DLayer,
+    DiffLayer,
+    PatchEmbed3D,
+    TimestepEmbedder,
+    CaptionEmbedder,
+    FinalLayer,
+    T2IFinalLayer,
+    get_2d_sincos_pos_embed,
+    get_1d_sincos_pos_embed,
+)
 
-        # Load and preprocess the video
-        frames = self.load_video(video_path)
-        if self.transform:
-            frames = self.transform(frames)
-
-        # Tokenize the description
-        encoded_text = self.tokenizer.encode_plus(
-            description,
-            max_length=self.max_length,
-            padding='max_length',
-            truncation=True,
-            return_tensors='pt'
-        )
-
-        return frames, encoded_text['input_ids'].squeeze(0)
-
-    def load_video(self, video_path, max_frames=32):
-        cap = cv2.VideoCapture(video_path)
-        frames = []
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frame = Image.fromarray(frame)
-            frames.append(frame)
-
-        cap.release()
-
-        # Make sure all videos have the same amount of frames
-        if len(frames) > max_frames:
-            frames = frames[:max_frames]
-        elif len(frames) < max_frames:
-            frames.extend([frames[-1]] * (max_frames - len(frames)))  # Padding with the last frame
-
-        return frames
+from Utils import (
+    debugprint,
+    get_st_attn_mask,
+    get_attn_bias_from_mask,
+    auto_grad_checkpoint,
+)
 
 
-class CausalConv3d(nn.Conv3d):
-    """ Causal 3D convolution layer for temporal consistency. """
-    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0):
-        super(CausalConv3d, self).__init__(in_channels, out_channels, kernel_size, stride, padding)
-        self.pad = (self.kernel_size[0] - 1, 0, 0, 0, 0, 0)
+class TheseusBlock(nn.Module):
+    def __init__(self, hidden_size, num_heads, d_s=None, d_t=None, d_s_h=16, d_s_w=16, mlp_ratio=4.0, drop_path=0.0, enable_temporal_attn=True, temporal_layer_type="conv3d", enable_mem_eff_attn=False, enable_flashattn=False,
+        enable_layernorm_kernel=False,
+        enable_sequence_parallelism=False,
+        debug=False,
+        *args,
+        **kwargs,
+    ) -> None:
+        super().__init__(*args, **kwargs)
 
-    def forward(self, x):
-        x = nn.functional.pad(x, self.pad)
-        return super(CausalConv3d, self).forward(x)
+        self.hidden_size = hidden_size
+        self.enable_flashattn = enable_flashattn
+        self.enable_temporal_attn = enable_temporal_attn
+        self.temporal_layer_type = temporal_layer_type
+        self.d_s = d_s
+        self.d_t = d_t
+        self.d_s_h = d_s_h
+        self.d_s_w = d_s_w
+        self.debugprint = debugprint(debug)
 
-
-class VAE3D(nn.Module):
-    def __init__(self, in_channels=3, latent_dim=512):
-        super(VAE3D, self).__init__()
-        # Encoder
-        self.encoder = nn.Sequential(
-            nn.Conv3d(in_channels, 32, kernel_size=3, stride=1, padding=1),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv3d(32, 64, kernel_size=3, stride=2, padding=1),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv3d(64, 128, kernel_size=3, stride=2, padding=1),
-            nn.LeakyReLU(0.2, inplace=True)
-        )
-
-        self.fc_mu = nn.Linear(128 * 4 * 16 * 16, latent_dim)
-        self.fc_logvar = nn.Linear(128 * 4 * 16 * 16, latent_dim)
-
-        # Decoder
-        self.fc_decoder = nn.Linear(latent_dim, 128 * 4 * 16 * 16)
-
-        self.decoder = nn.Sequential(
-            nn.ConvTranspose3d(128, 64, kernel_size=3, stride=2, padding=1, output_padding=1),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.ConvTranspose3d(64, 32, kernel_size=3, stride=2, padding=1, output_padding=1),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.ConvTranspose3d(32, in_channels, kernel_size=3, stride=1, padding=1),
-            nn.Tanh()
-        )
-
-    def encode(self, x):
-        h = self.encoder(x)
-        print(f"Shape after encoder: {h.shape}")
-        h = h.view(h.size(0), -1)
-        return self.fc_mu(h), self.fc_logvar(h)
-
-    def reparameterize(self, mu, logvar):
-        std = torch.exp(0.5 * logvar)
-        eps = torch.randn_like(std)
-        return mu + eps * std
-
-    def decode(self, z):
-        h = self.fc_decoder(z)
-        h = h.view(h.size(0), 128, 4, 16, 16)
-        return self.decoder(h)
-
-    def forward(self, x):
-        mu, logvar = self.encode(x)
-        z = self.reparameterize(mu, logvar)
-        return self.decode(z), mu, logvar
+        # layer norm for spatial-attn, temp-attn cross-attn and mlp
+        self.norm_s = get_layernorm(hidden_size,
+                                    eps=1e-6,
+                                    affine=False,
+                                    use_kernel=False)
+        self.norm_t = get_layernorm(hidden_size,
+                                    eps=1e-6,
+                                    affine=False,
+                                    use_kernel=False)
+        self.norm_ca = get_layernorm(hidden_size,
+                                     eps=1e-6,
+                                     affine=False,
+                                     use_kernel=False)
+        self.norm_mlp = get_layernorm(hidden_size,
+                                      eps=1e-6,
+                                      affine=False,
+                                      use_kernel=False)
 
 
-class ExpertTransformer(nn.Module):
-    def __init__(self, vocab_size, embed_dim=512, num_heads=8, num_layers=6):
-        super(ExpertTransformer, self).__init__()
-        self.embedding = nn.Embedding(vocab_size, embed_dim)
-        self.transformer = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(d_model=embed_dim, nhead=num_heads, batch_first=True),
-            num_layers=num_layers
-        )
-        self.fc = nn.Linear(embed_dim, embed_dim)
+        self.scale_shift_table = nn.Parameter(
+            torch.randn(9, hidden_size) / hidden_size**0.5)
 
-    def forward(self, x):
-        x = self.embedding(x)
-        x = self.transformer(x)
-        return self.fc(x.mean(dim=1))  # Average over sequence dimension
+
+        self.s_attn = Attention(hidden_size,
+                                num_heads=num_heads,
+                                qkv_bias=True,
+                                enable_flashattn=enable_flashattn,
+                                enable_mem_eff_attn=enable_mem_eff_attn)
+
+        if temporal_layer_type == "conv3d":
+
+            self.diff_layer = DiffLayer(dim=hidden_size)
+            self.conv3d = Conv3DLayer(dim=hidden_size,
+                                      inner_dim=256,
+                                      enable_proj_out=True)
+        elif (temporal_layer_type
+              == "temporal_only_attn") or (temporal_layer_type
+                                           == "spatial_temporal_attn"):
+            self.t_attn = Attention(hidden_size,
+                                    num_heads=num_heads,
+                                    qkv_bias=True,
+                                    enable_flashattn=enable_flashattn,
+                                    enable_mem_eff_attn=enable_mem_eff_attn)
+        else:
+            self.t_attn = None
+
+
+        self.cross_attn = MultiHeadCrossAttention(hidden_size, num_heads)
+
+
+        self.mlp = Mlp(in_features=hidden_size,
+                       hidden_features=int(hidden_size * mlp_ratio),
+                       act_layer=approx_gelu,
+                       drop=0)
+
+        self.drop_path = DropPath(
+            drop_prob=drop_path) if drop_path > 0.0 else nn.Identity()
+
+    def forward(self, x, y, t, mask=None, tpe=None, st_attn_bias=None):
+        self.debugprint("inside ", self.__class__)
+
+        B, N, C = x.shape
+
+        (shift_msa_s, scale_msa_s, gate_msa_s, shift_msa_t, scale_msa_t,
+         gate_msa_t, shift_mlp, scale_mlp,
+         gate_mlp) = (self.scale_shift_table[None] +
+                      t.reshape(B, 9, -1)).chunk(9, dim=1)
+
+
+        x_m_s = modulate(self.norm_s(x), shift_msa_s, scale_msa_s)
+
+
+        self.debugprint("spatial branch", x_m_s.shape)
+        x_s = rearrange(x_m_s,
+                        "b (t s) c -> (b t) s c",
+                        t=self.d_t,
+                        s=self.d_s)
+        self.debugprint(x_s.shape)
+        x_s = self.s_attn(x_s)
+        self.debugprint(x_s.shape)
+        x_s = rearrange(x_s, "(b t) s c -> b (t s) c", t=self.d_t, s=self.d_s)
+        self.debugprint(x_s.shape)
+        x = x + self.drop_path(gate_msa_s * x_s)
+        self.debugprint(x.shape)
+
+
+        if self.enable_temporal_attn:
+
+            if tpe is not None and self.temporal_layer_type != "conv3d":
+                x = rearrange(x,
+                              "b (t s) c -> (b s) t c",
+                              t=self.d_t,
+                              s=self.d_s)
+                x = x + tpe
+                x = rearrange(x,
+                              "(b s) t c -> b (t s) c",
+                              t=self.d_t,
+                              s=self.d_s)
+
+
+            x_m_t = modulate(self.norm_t(x), shift_msa_t, scale_msa_t)
+
+            self.debugprint("temporal branch", x_m_t.shape)
+            x_t = rearrange(x_m_t,
+                            "b (t s) c -> (b s) t c",
+                            t=self.d_t,
+                            s=self.d_s)
+            self.debugprint(x_t.shape)
+
+            if self.temporal_layer_type == "conv3d":
+                self.debugprint("use conv3D")
+
+                x_t = rearrange(x_t,
+                                "(b s_h s_w) t c -> b c t s_h s_w",
+                                t=self.d_t,
+                                s_h=self.d_s_h,
+                                s_w=self.d_s_w)
+                self.debugprint(x_t.shape)
+                x_t = self.diff_layer(x_t)
+                x_t = self.conv3d(x_t)
+                self.debugprint(x_t.shape)
+                x_t = rearrange(x_t, "b c t s_h s_w -> b (t s_h s_w) c")
+                self.debugprint(x_t.shape)
+            elif self.temporal_layer_type == "temporal_only_attn":
+
+                x_t = self.t_attn(x_t)
+                self.debugprint(x_t.shape)
+                x_t = rearrange(x_t,
+                                "(b s) t c -> b (t s) c",
+                                t=self.d_t,
+                                s=self.d_s)
+            elif self.temporal_layer_type == "spatial_temporal_attn":
+
+                self.debugprint("use self-attn")
+
+                x_t = rearrange(x_t,
+                                "(b s) t c -> b (t s) c",
+                                t=self.d_t,
+                                s=self.d_s)
+                self.debugprint(x_t.shape)
+                x_t = self.t_attn(x_t, st_attn_bias)
+            else:
+                pass
+
+            self.debugprint(x_t.shape)
+            x = x + self.drop_path(gate_msa_t * x_t)
+            self.debugprint(x.shape)
+
+        # cross attention
+        self.debugprint("cross attn")
+        self.debugprint(x.shape, y.shape)
+        x = x + self.cross_attn(self.norm_ca(x), y, mask)
+        self.debugprint(x.shape)
+
+        # mlp
+        self.debugprint("feed-forward mlp")
+        x = x + self.drop_path(gate_mlp * self.mlp(
+            modulate(self.norm_mlp(x), shift_mlp, scale_mlp)))
+        self.debugprint(x.shape)
+
+        return x
 
 
 class Theseus(nn.Module):
-    def __init__(self, vae, transformer):
-        super(Theseus, self).__init__()
-        self.vae = vae
-        self.transformer = transformer
-        self.expert_adaln = nn.LayerNorm(1024)  # Adapt for different modalities
-        self.text_mapper = nn.Linear(512, 1024)
-
-    def forward(self, x_video, x_text):
-        # VAE to compress the video
-        mu, logvar = self.vae.encode(x_video)
-        z_vision = self.vae.reparameterize(mu, logvar)
-
-        # Transformer to process the text
-        z_text = self.transformer(x_text)
-        z_text = self.text_mapper(z_text)
-
-        # Normalize and combine vision and text features
-        z_vision = self.expert_adaln(z_vision)
-        z_combined = z_vision + z_text.unsqueeze(1).unsqueeze(2)  # Adjust for 3D tensors
-
-        # Rebuild the video
-        reconstructed_video = self.vae.decode(z_combined)
-
-        return reconstructed_video, mu, logvar
-
-class VGGPerceptualLoss(nn.Module):
-    def __init__(self):
-        super(VGGPerceptualLoss, self).__init__()
-        vgg = vgg16(weights=VGG16_Weights.DEFAULT)
-        self.vgg_layers = nn.ModuleList(vgg.features[:23]).eval()
-        for param in self.vgg_layers.parameters():
-            param.requires_grad = False
-
-    def forward(self, x):
-        features = []
-        for layer in self.vgg_layers:
-            x = layer(x)
-            if isinstance(layer, nn.MaxPool2d):
-                features.append(x)
-        return features
-
-def vae_loss(recon_x, x, mu, logvar, kl_weight=0.0001):
-    recon_loss = F.mse_loss(recon_x, x, reduction='sum')
-    kld_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-    return recon_loss + kl_weight * kld_loss
-
-def perceptual_loss(recon_x, x, vgg_model):
-    b, c, t, h, w = recon_x.shape
-    recon_x = recon_x.transpose(1, 2).reshape(b*t, c, h, w)
-    x = x.transpose(1, 2).reshape(b*t, c, h, w)
-    
-    recon_features = vgg_model(recon_x)
-    original_features = vgg_model(x)
-    
-    loss = 0
-    for recon_feature, original_feature in zip(recon_features, original_features):
-        loss += F.mse_loss(recon_feature, original_feature)
-    return loss / t  # Normalizar por el número de frames
-
-def total_loss(recon_x, x, mu, logvar, vgg_model, perceptual_weight=0.1):
-    vae_loss_value = vae_loss(recon_x, x, mu, logvar)
-    perceptual_loss_value = perceptual_loss(recon_x, x, vgg_model)
-    return vae_loss_value + perceptual_weight * perceptual_loss_value
-
-
-def save_video(tensor, path):
-    tensor = tensor.detach().permute(1, 2, 3, 0).cpu().numpy()  # Switch to (T, H, W, C)
-    tensor = (tensor * 255).astype(np.uint8)  # Scalar from [0, 1] to [0, 255]
-
-    out = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*'mp4v'), 10, (tensor.shape[2], tensor.shape[1]))
-
-    for frame in tensor:
-        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-        out.write(frame)
-
-    out.release()
-
-
-def train_vae_only(vae, dataloader, num_epochs, device):
-    vae.train()  # Modo de entrenamiento
-    optimizer = optim.AdamW(vae.parameters(), lr=1e-4)
-
-    for epoch in range(num_epochs):
-        running_loss = 0.0
-        for videos, _ in dataloader:  # Solo usamos los videos en esta fase
-            videos = videos.to(device)
 
-            # Forward pass a través del VAE
-            recon_videos, mu, logvar = vae(videos)
-
-            # Calcular la pérdida VAE
-            loss = vae_loss(recon_videos, videos, mu, logvar)
-
-            # Backpropagation
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-            running_loss += loss.item()
-
-        avg_loss = running_loss / len(dataloader)
-        print(f"VAE Epoch {epoch+1}/{num_epochs}, Loss: {avg_loss:.4f}")
-
-    # Guardar los pesos del VAE al terminar el entrenamiento
-    torch.save(vae.state_dict(), 'vae_weights.pth')
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-json_file = '/content/data/video_descriptions.json'
-video_dir = '/content/data/Videos/'
-batch_size = 1
-max_length = 512
-#num_epochs = 20
-
-transform = transforms.Compose([
-    transforms.Lambda(lambda frames: torch.stack([transforms.ToTensor()(frame) for frame in frames])),  # Convertir cada frame a tensor
-    transforms.Lambda(lambda x: x.permute(1, 0, 2, 3)), # Switch to (C, T, H, W)
-    transforms.Lambda(lambda x: x.unsqueeze(0)),  # Add batch dimension: (1, C, T, H, W)
-    transforms.Lambda(lambda x: torch.nn.functional.interpolate(x, size=(16, 64, 64), mode='trilinear', align_corners=False)),  # Interpolación
-    transforms.Lambda(lambda x: x.squeeze(0)),  # Remove batch dimension: (C, T, H, W)
-    transforms.Lambda(lambda x: x * 2 - 1)  # Normalize to [-1, 1]
-  ])
-
-dataset = RealVideoDataset(json_file, video_dir, transform=transform, max_length=512)
-dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-
-# Instanciar el VAE
-vae = VAE3D(in_channels=3, latent_dim=1024).to(device)
-
-# Entrenar el VAE
-train_vae_only(vae, dataloader, num_epochs=10, device=device)
-
-vgg_model = VGGPerceptualLoss().to(device)
-
-
-def train_full_model(model, dataloader, num_epochs, device, vgg_model):
-    model.train()
-    optimizer = optim.AdamW(model.parameters(), lr=1e-4)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=5, factor=0.5)
-
-    for epoch in range(num_epochs):
-        total_epoch_loss = 0
-        for videos, texts in dataloader:
-            videos, texts = videos.to(device), texts.to(device)
-            
-            print(f"Input video shape: {videos.shape}")
-            print(f"Input text shape: {texts.shape}")
-
-            # Forward pass a través del modelo completo
-            recon_videos, mu, logvar = model(videos, texts)
-            
-            print(f"Reconstructed video shape: {recon_videos.shape}")
-            print(f"mu shape: {mu.shape}")
-            print(f"logvar shape: {logvar.shape}")
-
-            # Calcular la pérdida total del modelo completo, incluyendo el modelo VGG
-            loss = total_loss(recon_videos, videos, mu, logvar, vgg_model)
-
-            # Backpropagation
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-            total_epoch_loss += loss.item()
-
-        avg_loss = total_epoch_loss / len(dataloader)
-        scheduler.step(avg_loss)
-        print(f"Full Model Epoch {epoch+1}/{num_epochs}, Loss: {avg_loss:.4f}")
-
-
-
-# Cargar los pesos entrenados del VAE
-vae = VAE3D(in_channels=3, latent_dim=1024)
-vae.load_state_dict(torch.load('vae_weights.pth'))  # Cargar los pesos guardados del VAE
-
-# Instanciar el modelo Theseus con el VAE entrenado
-transformer = ExpertTransformer(vocab_size=len(dataset.tokenizer), embed_dim=512)
-model = Theseus(vae, transformer).to(device)
-
-# Entrenar el modelo completo
-train_full_model(model, dataloader, num_epochs=10, device=device, vgg_model=vgg_model)
-
-
-
-
-
-def evaluate_model(model, dataloader, device):
-    model.eval()
-    total_loss = 0
-    criterion = nn.MSELoss()
-
-    with torch.no_grad():
-        for videos, texts in dataloader:
-            videos = videos.to(device)
-            texts = texts.to(device)
-
-            reconstructed_videos, _, _ = model(videos, texts)
-
-            if reconstructed_videos.size(2) != videos.size(2):
-                reconstructed_videos = reconstructed_videos[:, :, :videos.size(2), :, :]
-
-            loss = criterion(reconstructed_videos, videos)
-            total_loss += loss.item()
-
-    avg_loss = total_loss / len(dataloader)
-    return avg_loss
-
-
-json_file = '/content/data/video_descriptions.json'
-video_dir = '/content/data/Videos/'
-batch_size = 1
-max_length = 512
-#num_epochs = 20
-
-transform = transforms.Compose([
-    transforms.Lambda(lambda frames: torch.stack([transforms.ToTensor()(frame) for frame in frames])),  # Convertir cada frame a tensor
-    transforms.Lambda(lambda x: x.permute(1, 0, 2, 3)), # Switch to (C, T, H, W)
-    transforms.Lambda(lambda x: x.unsqueeze(0)),  # Add batch dimension: (1, C, T, H, W)
-    transforms.Lambda(lambda x: torch.nn.functional.interpolate(x, size=(16, 64, 64), mode='trilinear', align_corners=False)),  # Interpolación
-    transforms.Lambda(lambda x: x.squeeze(0)),  # Remove batch dimension: (C, T, H, W)
-    transforms.Lambda(lambda x: x * 2 - 1)  # Normalize to [-1, 1]
-  ])
-
-dataset = RealVideoDataset(json_file, video_dir, transform=transform, max_length=512)
-dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-
-# Cargar los pesos entrenados del VAE en Theseus
-#vae = VAE3D(in_channels=3, latent_dim=1024)
-#vae.load_state_dict(torch.load('vae_weights.pth'))  # Cargar los pesos guardados
-
-#transformer = ExpertTransformer(vocab_size=len(dataset.tokenizer), embed_dim=512)
-#model = Theseus(vae, transformer).to(device)
-
-# Entrenar el modelo completo
-#train_full_model(model, dataloader, num_epochs=100, device=device)
-
-#device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-#model = model.to(device)
-
-#train_model(model, dataloader, num_epochs, device)
-
-avg_loss = evaluate_model(model, dataloader, device)
-print(f"Average reconstruction loss: {avg_loss:.4f}")
-
-# Guardar algunos videos reconstruidos
-for i, (video, text) in enumerate(dataloader):
-    if i >= 3:  # Limitar el número de videos reconstruidos a 3
-        break
-
-    video = video.to(device)
-    text = text.to(device)
-
-    # Reconstruir el video usando el modelo entrenado
-    reconstructed_video, _, _ = model(video, text)
-
-    # Guardar el video reconstruido
-    save_video(reconstructed_video[0], f'reconstructed_video_{i+1}.mp4')
-
-print("Evaluation complete and reconstructed videos saved.")
-
+    def __init__(self, input_size=(16, 32, 32), in_channels=4, patch_size=(1, 2, 2), hidden_size=1152, depth=28, num_heads=16,
+        mlp_ratio=4.0,
+        class_dropout_prob=0.1,
+        pred_sigma=True,
+        drop_path=0.0,
+        caption_channels=4096,
+        model_max_length=120,
+        space_scale=1.0,
+        time_scale=1.0,
+        freeze=None,
+        use_tpe_initially=True,
+        enable_temporal_attn=True,
+        temporal_layer_type="conv3d",
+        enable_mem_eff_attn=False,
+        enable_flashattn=False,
+        enable_layernorm_kernel=False,
+        enable_sequence_parallelism=False,
+        enable_grad_checkpoint=False,
+        debug=False,
+        *args,
+        **kwargs,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+
+        self.debugprint = debugprint(debug)
+        self.enable_grad_checkpoint = enable_grad_checkpoint
+
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.in_channels = in_channels
+        self.out_channels = in_channels * 2 if pred_sigma else in_channels
+        self.patch_size = patch_size
+        self.patch_size_nd = np.prod(patch_size)
+        st_patches = [input_size[i] // patch_size[i] for i in range(3)]
+        self.num_temporal = st_patches[0]
+        self.num_spatial_h = st_patches[1]
+        self.num_spatial_w = st_patches[2]
+        self.num_spatial = self.num_spatial_h * self.num_spatial_w
+        self.num_patches = self.num_temporal * self.num_spatial
+        self.num_heads = num_heads
+        self.temporal_layer_type = temporal_layer_type
+        self.use_tpe_initially = use_tpe_initially
+
+        self.space_scale = space_scale
+        self.time_scale = time_scale
+
+        self.x_embedder = PatchEmbed3D(patch_size=patch_size,
+                                       in_chans=in_channels,
+                                       embed_dim=hidden_size)
+        self.t_embedder = TimestepEmbedder(hidden_size=hidden_size)
+        # a shared adaLN for all blocks
+        self.t_block = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_size, 9 * hidden_size, bias=True),
+        )
+        self.y_embedder = CaptionEmbedder(
+            in_channels=caption_channels,
+            hidden_size=hidden_size,
+            uncond_prob=class_dropout_prob,
+            act_layer=approx_gelu,
+            token_num=model_max_length,
+        )
+
+        self.pos_embed = nn.Parameter(self.get_spatial_pos_embed(),
+                                      requires_grad=False)
+        self.temporal_pos_embed = nn.Parameter(self.get_temporal_pos_embed(),
+                                               requires_grad=False)
+
+        drop_path = [val.item() for val in torch.linspace(0, drop_path, depth)]
+        self.blocks = nn.ModuleList([
+            TheseusBlock(
+                hidden_size=hidden_size,
+                num_heads=num_heads,
+                d_s=self.num_spatial,
+                d_t=self.num_temporal,
+                d_s_h=self.num_spatial_h,
+                d_s_w=self.num_spatial_w,
+                mlp_ratio=mlp_ratio,
+                drop_path=drop_path[i],
+                enable_temporal_attn=enable_temporal_attn,
+                temporal_layer_type=temporal_layer_type,
+                enable_mem_eff_attn=enable_mem_eff_attn,
+                enable_flashattn=enable_flashattn,
+                enable_layernorm_kernel=enable_layernorm_kernel,
+                enable_sequence_parallelism=enable_sequence_parallelism,
+                debug=debug,
+            ) for i in range(depth)
+        ])
+
+        self.st_attn_bias = None
+        if temporal_layer_type == "spatial_temporal_attn":
+            st_attn_mask = get_st_attn_mask(T=self.num_temporal,
+                                            H=self.num_spatial_h,
+                                            W=self.num_spatial_w,
+                                            t_window=8,
+                                            s_window=5)  # [M, M]
+            st_attn_bias = get_attn_bias_from_mask(st_attn_mask).unsqueeze(
+                0).repeat([num_heads, 1, 1])  # [H, M, M]
+            self.st_attn_bias = nn.Parameter(st_attn_bias, requires_grad=False)
+            self.debugprint("st attn bias shape", self.st_attn_bias.shape)
+
+        self.final_layer = T2IFinalLayer(hidden_size,
+                                         self.patch_size_nd,
+                                         out_channels=self.out_channels)
+
+        self.initialize_weights()
+        self.initialize_temporal()
+
+    def forward(self, x, t, y, mask=None):
+
+        bs = x.shape[0]
+
+        self.debugprint("inside ", self.__class__)
+
+
+        self.debugprint(x.shape)
+        x = self.x_embedder(x) 
+        self.debugprint(x.shape)
+
+        x = rearrange(x,
+                      "B (T S) C -> B T S C",
+                      T=self.num_temporal,
+                      S=self.num_spatial)
+        self.debugprint(x.shape)
+        x = x + self.pos_embed
+        x = rearrange(x, "B T S C -> B (T S) C")
+        self.debugprint(x.shape)
+
+  
+        if self.use_tpe_initially:
+            x = rearrange(x,
+                          "B (T S) C -> B S T C",
+                          T=self.num_temporal,
+                          S=self.num_spatial)
+            x = x + self.temporal_pos_embed
+            x = rearrange(x, "B S T C -> B (T S) C")
+
+        self.debugprint("t shapes")
+        self.debugprint(t.shape)
+        t = self.t_embedder(t, x.dtype)  
+        self.debugprint(t.shape)
+        t0 = self.t_block(t) 
+        self.debugprint(t0.shape)
+
+        self.debugprint("y shapes")
+        self.debugprint(y.shape)
+        y = self.y_embedder(y, self.training) 
+        self.debugprint(y.shape)
+
+        if mask is not None:
+            if mask.shape[0] != y.shape[0]:
+                mask = mask.repeat(y.shape[0] // mask.shape[0], 1)
+            y = y.squeeze(1).masked_select(mask.unsqueeze(-1) != 0).view(
+                1, -1, y.shape[-1])
+            y_lens = mask.sum(dim=1).tolist() 
+        else:
+            y_lens = [y.shape[2]] * y.shape[0]
+            y = y.squeeze(1).view(1, -1, y.shape[-1])  
+        self.debugprint(y.shape)
+
+        st_attn_bias = self.st_attn_bias
+        if self.st_attn_bias is not None:
+            st_attn_bias = self.st_attn_bias.unsqueeze(0).repeat(
+                [bs, 1, 1, 1])  
+
+        tpe = None if self.use_tpe_initially else self.temporal_pos_embed
+
+        for block in self.blocks:
+            if self.enable_grad_checkpoint:
+                x = auto_grad_checkpoint(block, x, y, t0, y_lens, tpe,
+                                         st_attn_bias)
+            else:
+                x = block(x, y, t0, y_lens, tpe, st_attn_bias)
+
+        self.debugprint("blocks out:", x.shape)
+
+        x = self.final_layer(x, t)
+        self.debugprint("final layer: ", x.shape)
+        x = self.unpatchify(x) 
+        self.debugprint("STDiT output: ", x.shape)
+
+        return x
+
+    def unpatchify(self, x):
+        x = rearrange(
+            x,
+            "B (Nt Nh Nw) (Pt Ph Pw C) -> B C (Nt Pt) (Nh Ph) (Nw Pw)",
+            Nt=self.num_temporal,
+            Nh=self.num_spatial_h,
+            Nw=self.num_spatial_w,
+            Pt=self.patch_size[0],
+            Ph=self.patch_size[1],
+            Pw=self.patch_size[2],
+            C=self.out_channels,
+        )
+
+        return x
+
+    def get_spatial_pos_embed(self, grid_size=None):
+        if grid_size is None:
+            grid_size = (self.num_spatial_h, self.num_spatial_w)
+        pos_embed = get_2d_sincos_pos_embed(self.hidden_size, grid_size,
+                                            self.space_scale)
+        pos_embed = torch.from_numpy(pos_embed).float().unsqueeze(
+            0)  
+
+        return pos_embed
+
+    def get_temporal_pos_embed(self):
+        pos_embed = get_1d_sincos_pos_embed(
+            self.hidden_size,
+            self.num_temporal,
+            scale=self.time_scale,
+        )
+        pos_embed = torch.from_numpy(pos_embed).float().unsqueeze(0)
+        return pos_embed
+
+    def initialize_temporal(self):
+        if ("attn"
+                in self.temporal_layer_type) or ("attention"
+                                                 in self.temporal_layer_type):
+            for block in self.blocks:
+                nn.init.constant_(block.t_attn.proj.weight, 0)
+                nn.init.constant_(block.t_attn.proj.bias, 0)
+
+    def initialize_weights(self):
+        def _basic_init(module):
+            if isinstance(module, nn.Linear):
+                torch.nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+
+        self.apply(_basic_init)
+ 
+        w = self.x_embedder.proj.weight.data
+        nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
+
+        nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
+        nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
+
+        nn.init.constant_(self.t_block[-1].weight, 0)
+        nn.init.constant_(self.t_block[-1].bias, 0)
+
+        nn.init.normal_(self.y_embedder.y_proj.fc1.weight, std=0.02)
+        nn.init.normal_(self.y_embedder.y_proj.fc2.weight, std=0.02)
+
+        for block in self.blocks:
+            nn.init.constant_(block.cross_attn.proj.weight, 0)
+            nn.init.constant_(block.cross_attn.proj.bias, 0)
+
+        nn.init.constant_(self.final_layer.linear.weight, 0)
+        nn.init.constant_(self.final_layer.linear.bias, 0)
