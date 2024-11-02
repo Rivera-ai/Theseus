@@ -10,22 +10,19 @@ from Utils import forward_hook_func, backward_hook_func
 
 approx_gelu = lambda: nn.GELU(approximate="tanh")
 
-
 def modulate(x, shift, scale):
     return x * (1 + scale) + shift
 
 def get_layernorm(hidden_size: torch.Tensor, eps: float, affine: bool, use_kernel: bool):
     if use_kernel:
-        try:
-            pass
-            #from apex.normalization import FusedLayerNorm
+        try:            
+            from apex.normalization import FusedLayerNorm
 
-            #return FusedLayerNorm(hidden_size, elementwise_affine=affine, eps=eps)
+            return FusedLayerNorm(hidden_size, elementwise_affine=affine, eps=eps)
         except ImportError:
             raise RuntimeError("FusedLayerNorm not available. Please install apex.")
-    else:
-        pass 
-#        return nn.LayerNorm(hidden_size, eps, elementwise_affine=affine)
+    else: 
+        return nn.LayerNorm(hidden_size, eps, elementwise_affine=affine)
 
 class Conv3DLayer(nn.Module):
     def __init__(self, dim, inner_dim, enable_proj_out, *args, **kwargs):

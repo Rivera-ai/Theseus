@@ -2,7 +2,8 @@ import math
 import numpy as np
 import torch as th
 import enum
-from DiffusionUtils import discretized_gaussian_log_likelihood, NormalKl
+
+from .DiffusionUtils import discretized_gaussian_log_likelihood, NormalKl
 
 def mean_flat(tensor):
     """

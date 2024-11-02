@@ -13,12 +13,10 @@ class AbstractEncoder(nn.Module):
         raise NotImplementedError
 
 class FrozenCLIPEmbedder(AbstractEncoder):
-
-    def __init__(self, path="helenai/runwayml-stable-diffusion-v1-5-ov", device="cuda", max_length=77):
+    def __init__(self, path="stabilityai/stable-diffusion-xl-base-1.0", device="cuda", max_length=77):
         super().__init__()
         self.tokenizer = CLIPTokenizer.from_pretrained(path, subfolder="tokenizer")
         self.transformer = CLIPTextModel.from_pretrained(path, subfolder="text_encoder")
-
         self.device = device
         self.max_length = max_length
         self._freeze()
@@ -39,27 +37,33 @@ class FrozenCLIPEmbedder(AbstractEncoder):
             return_tensors="pt"
         )
 
-        tokens = batch_encoding["inputs_ids"].to(self.device)
-        mask = batch_encoding['attention_mask']
+        tokens = batch_encoding["input_ids"].to(self.device)  # Corregido "inputs_ids" a "input_ids"
+        mask = batch_encoding["attention_mask"].to(self.device)
         outputs = self.transformer(input_ids=tokens)
 
         z = outputs.last_hidden_state
         pooled_z = outputs.pooler_output
         return z, pooled_z, mask
 
+    def encode(self, text):
+        return self.forward(text)
+
 class CLIPEncoder:
     def __init__(self, from_pretrained, model_max_length=77, device="cuda", dtype=torch.float):
         super().__init__()
 
-        assert from_pretrained is not None, "Please specify the path to the T5 model"
+        assert from_pretrained is not None, "Please specify the path to the CLIP model"
 
-        self.text_encoder = FrozenCLIPEmbedder(path=from_pretrained, max_length=model_max_length).to(device, dtype)
-
-        in_channels = 768
-        self.y_embedding = self.encode([""])['y'].squeeze()
+        self.text_encoder = FrozenCLIPEmbedder(
+            path=from_pretrained, 
+            max_length=model_max_length
+        ).to(device, dtype)
 
         self.model_max_length = model_max_length
-        self.output_dim = self.text_encoder.transformer.config.hidde_size
+        self.output_dim = self.text_encoder.transformer.config.hidden_size  # Corregido hidde_size
+        
+        # Compute null embedding
+        self.y_embedding = self.encode([""])["y"].squeeze()
 
     def encode(self, text):
         embeddings, pooled_embeddings, mask = self.text_encoder.encode(text)

@@ -1,0 +1,48 @@
+{
+    "debug": false,
+    "text_key": "text",
+    "use_preprocessed_data": false,
+    
+    "num_frames": 16,
+    "frame_interval": 4,
+    "image_size": [256, 256],
+    
+    "depth": 12,
+    "hidden_size": 768,
+    "num_heads": 12,
+    "patch_size": [1, 2, 2],
+    
+    "use_tpe_initially": true,
+    "enable_temporal_attn": true,
+    "enable_mem_eff_attn": false,
+    "enable_flashattn": true,
+    "enable_grad_ckpt": true,
+    "temporal_layer_type": "temporal_only_attn",
+    
+    "noise_schedule": "linear",
+    "token_drop_prob": 0.1,
+    "use_ema": true,
+    
+    "vae_pretrained": "madebyollin/sdxl-vae-fp16-fix",
+    "subfolder": "",
+    "textenc_pretrained": "stabilityai/stable-diffusion-xl-base-1.0",
+    "model_max_length": 77,
+    "text_encoder_output_dim": 768,
+    
+    "root": "/teamspace/studios/this_studio/data/Videos",
+    "data_path": "/teamspace/studios/this_studio/data/dataset.csv",
+    "num_workers": 4,
+    
+    "dtype": "fp32",
+    "seed": 123,
+    "outputs": "outputs",
+    
+    "epochs": 3000,
+    "log_every": 1,
+    "ckpt_every": 1000,
+    "accum_iter": 1,
+    
+    "batch_size": 2,
+    "lr": 3e-5,
+    "grad_clip": 1.0
+  }

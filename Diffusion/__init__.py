@@ -1,8 +1,7 @@
 from functools import partial
 import torch
-from ReSpace import SpacedDiffusion, space_timesteps
-import GaussianDiffusion as gd
-
+from .ReSpace import SpacedDiffusion, space_timesteps
+from . import GaussianDiffusion as gd
 
 class IDDPM(SpacedDiffusion):
 
