@@ -7,6 +7,9 @@ from collections import OrderedDict
 import logging
 import argparse
 import json
+import matplotlib.pyplot as plt
+import matplotlib
+matplotlib.use('Agg')  # Para usar matplotlib sin GUI
 
 from tqdm import tqdm
 import torch
@@ -113,6 +116,88 @@ def to_torch_dtype(dtype):
     else:
         raise ValueError
 
+def log_tensor_stats(name, tensor_or_dict, logger=None):
+    """
+    Log statistics about tensors with proper type handling.
+    """
+    def get_tensor_stats(tensor, key_name=""):
+        stats = {
+            "Shape": tensor.shape,
+            "Type": tensor.dtype,
+            "Device": tensor.device,
+            "Range": [tensor.min().item(), tensor.max().item()],
+            "Has NaN": torch.isnan(tensor).any().item(),
+            "Has Inf": torch.isinf(tensor).any().item(),
+        }
+        
+        # Solo calcular media y std para tipos flotantes
+        if tensor.dtype in [torch.float16, torch.float32, torch.float64]:
+            stats["Mean"] = tensor.mean().item()
+            stats["Std"] = tensor.std().item()
+        
+        # Para tensores binarios o de tipo entero, calcular otros stats relevantes
+        else:
+            if tensor.dtype in [torch.int32, torch.int64, torch.bool]:
+                unique_vals = torch.unique(tensor)
+                stats["Unique values"] = unique_vals.tolist()
+                stats["Value counts"] = [(val.item(), (tensor == val).sum().item()) 
+                                       for val in unique_vals]
+        
+        return stats
+
+    if logger:
+        logger.info(f"\n{'-'*20} {name} {'-'*20}")
+        
+        if isinstance(tensor_or_dict, dict):
+            logger.info("Dictionary containing:")
+            for k, v in tensor_or_dict.items():
+                logger.info(f"\nKey: {k}")
+                if torch.is_tensor(v):
+                    stats = get_tensor_stats(v, k)
+                    for stat_name, stat_value in stats.items():
+                        if stat_name == "Range":
+                            logger.info(f"{stat_name}: [{stat_value[0]:.4f}, {stat_value[1]:.4f}]")
+                        elif stat_name in ["Mean", "Std"]:
+                            logger.info(f"{stat_name}: {stat_value:.4f}")
+                        else:
+                            logger.info(f"{stat_name}: {stat_value}")
+                            
+                    # Guardar histograma solo para tensores flotantes
+                    if v.dtype in [torch.float16, torch.float32, torch.float64]:
+                        debug_dir = "debug_generation"
+                        os.makedirs(debug_dir, exist_ok=True)
+                        values = v.flatten().cpu().numpy()
+                        hist_path = os.path.join(debug_dir, f'hist_{name.lower()}_{k}.png')
+                        plt.figure(figsize=(10, 5))
+                        plt.hist(values, bins=50)
+                        plt.title(f"{name} - {k} Distribution")
+                        plt.savefig(hist_path)
+                        plt.close()
+                else:
+                    logger.info(f"Value: {v} (type: {type(v)})")
+        
+        elif torch.is_tensor(tensor_or_dict):
+            stats = get_tensor_stats(tensor_or_dict)
+            for stat_name, stat_value in stats.items():
+                if stat_name == "Range":
+                    logger.info(f"{stat_name}: [{stat_value[0]:.4f}, {stat_value[1]:.4f}]")
+                elif stat_name in ["Mean", "Std"]:
+                    logger.info(f"{stat_name}: {stat_value:.4f}")
+                else:
+                    logger.info(f"{stat_name}: {stat_value}")
+            
+            # Guardar histograma solo para tensores flotantes
+            if tensor_or_dict.dtype in [torch.float16, torch.float32, torch.float64]:
+                debug_dir = "debug_generation"
+                os.makedirs(debug_dir, exist_ok=True)
+                values = tensor_or_dict.flatten().cpu().numpy()
+                hist_path = os.path.join(debug_dir, f'hist_{name.lower().replace(" ", "_")}.png')
+                plt.figure(figsize=(10, 5))
+                plt.hist(values, bins=50)
+                plt.title(f"{name} Value Distribution")
+                plt.savefig(hist_path)
+                plt.close()
+
 def generate_sample_video(
     model,
     scheduler,
@@ -124,38 +209,177 @@ def generate_sample_video(
     device,
     dtype,
     num_inference_steps=50,
+    logger=None
 ):
-    """Generate a sample video using the model."""
-    with torch.no_grad():
-        # Calculate latent size based on VAE patch size
-        latent_size = vae.get_latent_size([num_frames, image_size[0], image_size[1]])
-        z_size = [vae.out_channels] + latent_size
-        
-        # Initialize scheduler timesteps if needed
-        if num_inference_steps is not None:
-            scheduler.timestep_respacing = str(num_inference_steps)
-        
-        # Generate sample using IDDPM's built-in sampling
-        samples = scheduler.sample(
-            model=model,
-            text_encoder=text_encoder,
-            z_size=z_size,
-            prompts=[prompt],
-            device=device
-        )
-        
-        # Decode the latents to frames
-        with autocast('cuda'):
-            video = vae.decode(samples)
+    """Generate a sample video with latent value control."""
+    was_training = model.training
+    model.eval()
+    vae.eval()
+    
+    try:
+        with torch.no_grad():
+            # Setup inicial
+            latent_size = vae.get_latent_size([num_frames, image_size[0], image_size[1]])
+            z_size = [vae.out_channels] + latent_size
             
-        # Normalize to [0, 1] for saving
-        video = (video + 1) / 2
-        video = torch.clamp(video, 0, 1)
-        
-        return video
+            if logger:
+                logger.info(f"\nLatent size: {z_size}")
+            
+            # Generar latents
+            samples = scheduler.sample(
+                model=model,
+                text_encoder=text_encoder,
+                z_size=z_size,
+                prompts=[prompt],
+                device=device
+            )
+            
+            # Log de los latents originales
+            if logger:
+                logger.info("\n=== Original Latents ===")
+                logger.info(f"Shape: {samples.shape}")
+                logger.info(f"Range: [{samples.min().item():.4f}, {samples.max().item():.4f}]")
+                logger.info(f"Mean: {samples.mean().item():.4f}")
+                logger.info(f"Std: {samples.std().item():.4f}")
+            
+            # Normalizar los latents a un rango razonable
+            # Los VAEs típicamente esperan latents en el rango [-4, 4]
+            max_latent_value = 4.0
+            samples = torch.clamp(samples, -max_latent_value, max_latent_value)
+            
+            # Escalar si la std es muy alta
+            current_std = samples.std()
+            if current_std > 1.0:
+                samples = samples / current_std
+                
+            # Log de los latents normalizados
+            if logger:
+                logger.info("\n=== Normalized Latents ===")
+                logger.info(f"Range: [{samples.min().item():.4f}, {samples.max().item():.4f}]")
+                logger.info(f"Mean: {samples.mean().item():.4f}")
+                logger.info(f"Std: {samples.std().item():.4f}")
+            
+            # Decodificar con mejor manejo de errores
+            try:
+                with autocast('cuda'):
+                    video = vae.decode(samples)
+                    
+                    # Verificar NaNs inmediatamente
+                    if torch.isnan(video).any():
+                        if logger:
+                            logger.warning("NaNs detected in decoded video. Trying fallback decoding...")
+                        
+                        # Intento de recuperación
+                        samples = samples * 0.5  # Reducir la magnitud
+                        video = vae.decode(samples.to(dtype))
+                    
+                    if torch.isnan(video).any():
+                        raise ValueError("VAE produced NaNs even after fallback attempt")
+                    
+                    if logger:
+                        logger.info("\n=== Decoded Video ===")
+                        logger.info(f"Shape: {video.shape}")
+                        logger.info(f"Range: [{video.min().item():.4f}, {video.max().item():.4f}]")
+                        logger.info(f"Mean: {video.mean().item():.4f}")
+                        logger.info(f"Std: {video.std().item():.4f}")
+                    
+                    return video
+                    
+            except Exception as e:
+                if logger:
+                    logger.error(f"Error during VAE decoding: {str(e)}")
+                raise
+            
+    except Exception as e:
+        if logger:
+            logger.error(f"Error during generation: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+        raise
+    finally:
+        if was_training:
+            model.train()
+            
+def save_video_frames(video_tensor, save_path, fps=8, logger=None):
+    """
+    Guarda frames de video manejando correctamente las dimensiones.
+    Args:
+        video_tensor: torch.Tensor de forma [B, C, T, H, W] o [C, T, H, W]
+        save_path: ruta donde guardar el video
+        fps: frames por segundo
+        logger: logger opcional
+    """
+    if logger:
+        logger.info(f"\n=== Video Tensor Analysis ===")
+        logger.info(f"Shape: {video_tensor.shape}")
+        logger.info(f"Range: [{video_tensor.min():.4f}, {video_tensor.max():.4f}]")
+        logger.info(f"Mean: {video_tensor.mean():.4f}")
+        logger.info(f"Std: {video_tensor.std():.4f}")
 
-def save_video_frames(video_tensor, save_path, fps=8):
-    """Save video tensor as MP4 file using OpenCV."""
+    # Remover dimensión de batch si existe
+    if video_tensor.dim() == 5:
+        video_tensor = video_tensor.squeeze(0)  # [B, C, T, H, W] -> [C, T, H, W]
+
+    # Asegurar que estamos en CPU y formato float32
+    video_tensor = video_tensor.cpu().float()
+
+    # Normalizar a [0, 1]
+    if video_tensor.min() < 0 or video_tensor.max() > 1:
+        video_tensor = (video_tensor - video_tensor.min()) / (video_tensor.max() - video_tensor.min())
+
+    # Convertir a uint8 [0, 255]
+    video_uint8 = (video_tensor * 255).clamp(0, 255).numpy().astype(np.uint8)
+
+    # Reordenar dimensiones: [C, T, H, W] -> [T, H, W, C]
+    video = np.transpose(video_uint8, (1, 2, 3, 0))
+
+    if logger:
+        logger.info(f"Processed video shape: {video.shape}")
+        logger.info(f"Final range: [{video.min()}, {video.max()}]")
+
+    # Crear directorio para frames
+    frames_dir = save_path.rsplit('.', 1)[0] + '_frames'
+    os.makedirs(frames_dir, exist_ok=True)
+
+    # Guardar frames individuales
+    for i in range(video.shape[0]):
+        try:
+            frame = video[i]  # [H, W, C]
+            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            frame_path = os.path.join(frames_dir, f'frame_{i:04d}.png')
+            cv2.imwrite(frame_path, frame_bgr)
+            
+            if logger:
+                logger.info(f"Saved frame {i} - Range: [{frame.min()}, {frame.max()}], "
+                          f"Mean: {frame.mean():.2f}")
+        except Exception as e:
+            if logger:
+                logger.error(f"Error saving frame {i}: {str(e)}")
+
+    # Guardar video
+    try:
+        height, width = video.shape[1:3]
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(save_path, fourcc, fps, (width, height))
+
+        for frame in video:
+            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            out.write(frame_bgr)
+        
+        out.release()
+        
+        if logger:
+            logger.info(f"Successfully saved video to {save_path}")
+    except Exception as e:
+        if logger:
+            logger.error(f"Error saving video: {str(e)}")
+
+def save_reference_video(video_tensor, save_path, fps=8):
+    """Save a reference video tensor as MP4 file using OpenCV."""
+    # If video is in [-1, 1] range, normalize to [0, 1]
+    if video_tensor.min() < 0:
+        video_tensor = (video_tensor + 1) / 2
+    
     # Ensure we're working with the first item if this is a batch
     if video_tensor.dim() == 5:  # [B, C, T, H, W]
         video_tensor = video_tensor[0]  # [C, T, H, W]
@@ -184,7 +408,7 @@ def save_video_frames(video_tensor, save_path, fps=8):
     finally:
         out.release()
         
-    # Save also as a backup in individual frames if video writing fails
+    # Save also as a backup in individual frames
     frames_dir = save_path.rsplit('.', 1)[0] + '_frames'
     os.makedirs(frames_dir, exist_ok=True)
     
@@ -342,18 +566,31 @@ def main():
     if cfg.use_ema:
         update_ema(ema, model, decay=0)
 
-    scaler = torch.cuda.amp.GradScaler()
+    scaler = torch.amp.GradScaler()
 
     # Training loop
     for epoch in range(start_epoch, cfg.epochs):
         logger.info(f"Beginning epoch {epoch}...")
 
         if not cfg.use_preprocessed_data:
-            prompt = sample_prompts[current_prompt_idx]
-            logger.info(f"Generating sample video for epoch {epoch} with prompt: {prompt}")
+            # Get and save reference video
+            first_batch = next(iter(dataloader))
+            reference_video = first_batch["video"][0]
             
-            # Switch prompt for next epoch
+            # Log reference video stats
+            logger.info(f"Reference video stats - Shape: {reference_video.shape}, Min: {reference_video.min().item():.4f}, Max: {reference_video.max().item():.4f}, Mean: {reference_video.mean().item():.4f}")
+            
+            ref_video_save_path = os.path.join(experiment_dir, f"reference_epoch_{epoch:03d}.mp4")
+            save_video_frames(reference_video, ref_video_save_path, logger=logger)
+            
+            # Generate sample video with debugging
+            prompt = sample_prompts[current_prompt_idx]
             current_prompt_idx = (current_prompt_idx + 1) % len(sample_prompts)
+            
+            # Check model mode
+            logger.info(f"Model training mode: {model.training}")
+            if cfg.use_ema:
+                logger.info(f"EMA model training mode: {ema.training}")
             
             sample_video = generate_sample_video(
                 model if not cfg.use_ema else ema,
@@ -364,17 +601,21 @@ def main():
                 cfg.num_frames,
                 cfg.image_size,
                 device,
-                dtype
+                dtype,
+                logger=logger
             )
             
-            video_save_path = os.path.join(experiment_dir, f"sample_epoch_{epoch:03d}.mp4")
-            save_video_frames(sample_video, video_save_path)
-            logger.info(f"Saved sample video to {video_save_path}")
+            generated_video_save_path = os.path.join(experiment_dir, f"generated_epoch_{epoch:03d}.mp4")
+            save_video_frames(sample_video, generated_video_save_path, logger=logger)
             
-            # Save the prompt used for this sample
-            prompt_save_path = os.path.join(experiment_dir, f"sample_epoch_{epoch:03d}_prompt.txt")
-            with open(prompt_save_path, 'w') as f:
-                f.write(prompt)
+            # Save the prompt and reference video text
+            metadata_save_path = os.path.join(experiment_dir, f"epoch_{epoch:03d}_metadata.json")
+            metadata = {
+                "generation_prompt": prompt,
+                "reference_video_text": first_batch["text"][0]  # Get text for first video
+            }
+            with open(metadata_save_path, 'w') as f:
+                json.dump(metadata, f, indent=2)
 
         with tqdm(range(start_step, num_steps_per_epoch),
                   desc=f"Epoch {epoch}",

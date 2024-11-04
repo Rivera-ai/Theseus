@@ -18,7 +18,7 @@ class Config:
         self.use_tpe_initially = True
         self.enable_temporal_attn = True
         # "conv3d" or "temporal_only_attn" or "spatial_temporal_attn"
-        self.temporal_layer_type = "temporal_only_attn"
+        self.temporal_layer_type = "spatial_temporal_attn"
 
         self.enable_mem_eff_attn = False
         self.enable_flashattn = True

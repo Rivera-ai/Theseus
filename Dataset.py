@@ -9,7 +9,7 @@ import torchvision
 import torchvision.transforms as transforms
 from torchvision.datasets.folder import IMG_EXTENSIONS, pil_loader
 import json
-from VideoData import ToTensorVideo, RandomHorizontalFlipVideo, UCFCenterCropVideo
+from VideoData import ToTensorVideo, UCFCenterCropVideo
 
 """ Igual aqui dejo el dataset tanto para CSV como para JSON """
 
