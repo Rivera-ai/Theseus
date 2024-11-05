@@ -239,6 +239,7 @@ class DatasetFromCSV(torch.utils.data.Dataset):
             video = F.interpolate(video, size=(16, 256, 256), mode='trilinear', align_corners=False)
             video = video.squeeze(0)
             print(f"Print2. Final video tensor shape: {video.shape}")
+            
             #print(f"Final video tensor shape: {video.shape}")
             #print(f"Time taken: {time.time() - t0:.2f}s")
 
