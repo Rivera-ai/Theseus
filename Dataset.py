@@ -10,6 +10,7 @@ import torchvision.transforms as transforms
 from torchvision.datasets.folder import IMG_EXTENSIONS, pil_loader
 import json
 from VideoData import ToTensorVideo, UCFCenterCropVideo
+import torch.nn.functional as F
 
 """ Igual aqui dejo el dataset tanto para CSV como para JSON """
 
@@ -233,6 +234,11 @@ class DatasetFromCSV(torch.utils.data.Dataset):
                 #print("Applied transforms")
 
             video = video.permute(1, 0, 2, 3)  # C T H W
+            print(f"Print1. Final video tensor shape: {video.shape}")
+            video = video.unsqueeze(0)
+            video = F.interpolate(video, size=(16, 256, 256), mode='trilinear', align_corners=False)
+            video = video.squeeze(0)
+            print(f"Print2. Final video tensor shape: {video.shape}")
             #print(f"Final video tensor shape: {video.shape}")
             #print(f"Time taken: {time.time() - t0:.2f}s")
 
