@@ -46,7 +46,7 @@ class Conv3DLayer(nn.Module):
             self.proj_out = nn.Sequential(
                 nn.GroupNorm(32, inner_dim2),
                 nn.SiLU(),
-                nn.Conv3d(inner_dim2, dim, kernel_size=(3,3,3), stride=1, padding=0),
+                nn.Conv3d(inner_dim2, dim, kernel_size=(3,3,3), stride=1, padding=(1,1,1)),
             )
 
     def forward(self, x):
