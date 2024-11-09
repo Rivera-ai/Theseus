@@ -10,9 +10,22 @@ class Config:
         self.image_size = (256, 256)
         
         # Model architecture
-        self.depth = 12
-        self.hidden_size = 768
-        self.num_heads = 12
+        # DiT size settings based on the official Meta AI implementation:
+        # DiT-XL/2 = depth=28, hidden_size=1152, patch_size=2, num_heads=16
+        # DiT-XL/4 = depth=28, hidden_size=1152, patch_size=4, num_heads=16
+        # DiT-XL/8 = depth=28, hidden_size=1152, patch_size=8, num_heads=16
+        # DiT-L/2 = depth=24, hidden_size=1024, patch_size=2, num_heads=16
+        # DiT-L/4 = depth=24, hidden_size=1024, patch_size=4, num_heads=16
+        # DiT-L/8 = depth=24, hidden_size=1024, patch_size=8, num_heads=16
+        # DiT-B/2 = depth=12, hidden_size=768, patch_size=2, num_heads=12
+        # DiT-B/4 = depth=12, hidden_size=768, patch_size=4, num_heads=12
+        # DiT-B/8 = depth=12, hidden_size=768, patch_size=8, num_heads=12
+        # DiT-S/2 = depth=12, hidden_size=384, patch_size=2, num_heads=6
+        # DiT-S/4 = depth=12, hidden_size=384, patch_size=4, num_heads=6
+        # DiT-S/8 = depth=12, hidden_size=384, patch_size=8, num_heads=6
+        self.depth = 24
+        self.hidden_size = 1024
+        self.num_heads = 16
         self.patch_size = (1, 2, 2)
         
         self.use_tpe_initially = True
@@ -47,7 +60,7 @@ class Config:
         self.outputs = "outputs"
         
         # Training loop
-        self.epochs = 30
+        self.epochs = 100
         self.log_every = 1
         self.ckpt_every = 1
         self.accum_iter = 1
@@ -57,4 +70,5 @@ class Config:
         self.batch_size = 2  # ajusta según tu GPU
         self.lr = 3e-5
         self.grad_clip = 1.0
+        
         
